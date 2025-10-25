@@ -1,0 +1,3 @@
+This is a regular text file.
+It contains only printable ASCII characters.
+Line 3 of the file.
