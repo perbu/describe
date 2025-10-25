@@ -24,6 +24,11 @@ var embeddedVersion string
 type config struct {
 	apiKey string
 	model  string
+	debug  bool
+}
+
+var debugLog = func(format string, args ...interface{}) {
+	// no-op by default
 }
 
 func main() {
@@ -37,8 +42,6 @@ func main() {
 }
 
 func run(ctx context.Context, output io.Writer, argv []string) error {
-	_, _ = fmt.Fprintf(output, "describe %s\n", strings.TrimSpace(embeddedVersion))
-
 	runConfig, showHelp, err := getConfig(argv)
 	if err != nil {
 		return fmt.Errorf("getConfig: %w", err)
@@ -47,27 +50,43 @@ func run(ctx context.Context, output io.Writer, argv []string) error {
 		return nil
 	}
 
+	// Enable debug logging if requested
+	if runConfig.debug {
+		debugLog = func(format string, args ...interface{}) {
+			fmt.Fprintf(os.Stderr, "[DEBUG] "+format+"\n", args...)
+		}
+		debugLog("Debug mode enabled")
+		debugLog("Version: %s", strings.TrimSpace(embeddedVersion))
+		debugLog("Model: %s", runConfig.model)
+	}
+
+	debugLog("Opening git repository")
 	repo, err := git.PlainOpen(".")
 	if err != nil {
 		return fmt.Errorf("failed to open repository: %w", err)
 	}
 
+	debugLog("Getting staged changes")
 	changes, err := getStagedChanges(repo)
 	if err != nil {
 		return fmt.Errorf("getStagedChanges: %w", err)
 	}
 
 	if changes == "" {
+		debugLog("No staged changes found")
 		_, _ = fmt.Fprintf(output, "No staged changes found.\n")
 		return nil
 	}
 
+	debugLog("Found staged changes (%d bytes)", len(changes))
+	debugLog("Calling OpenRouter API")
 	description, err := describeChanges(ctx, runConfig, changes)
 	if err != nil {
 		return fmt.Errorf("describeChanges: %w", err)
 	}
 
-	_, _ = fmt.Fprintf(output, "\n%s\n", description)
+	debugLog("Received description from API (%d bytes)", len(description))
+	_, _ = fmt.Fprintf(output, "%s\n", description)
 	return nil
 }
 
@@ -77,6 +96,7 @@ func getConfig(args []string) (config, bool, error) {
 
 	flagSet := flag.NewFlagSet("describe", flag.ContinueOnError)
 	flagSet.StringVar(&cfg.model, "model", "anthropic/claude-4.5-sonnet", "Model to use for description.")
+	flagSet.BoolVar(&cfg.debug, "debug", false, "Enable debug logging.")
 	flagSet.BoolVar(&showhelp, "help", false, "Show help message.")
 
 	err := flagSet.Parse(args)
@@ -103,20 +123,24 @@ func getConfig(args []string) (config, bool, error) {
 }
 
 func getStagedChanges(repo *git.Repository) (string, error) {
+	debugLog("Getting worktree")
 	w, err := repo.Worktree()
 	if err != nil {
 		return "", fmt.Errorf("repo.Worktree: %w", err)
 	}
 
+	debugLog("Getting status")
 	status, err := w.Status()
 	if err != nil {
 		return "", fmt.Errorf("worktree.Status: %w", err)
 	}
 
 	// Try to get HEAD, but handle the case where there are no commits yet
+	debugLog("Getting HEAD")
 	head, err := repo.Head()
 	var headTree *object.Tree
 	if err == nil {
+		debugLog("HEAD found, getting commit")
 		headCommit, err := repo.CommitObject(head.Hash())
 		if err != nil {
 			return "", fmt.Errorf("failed to get HEAD commit: %w", err)
@@ -125,52 +149,62 @@ func getStagedChanges(repo *git.Repository) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to get HEAD tree: %w", err)
 		}
+	} else {
+		debugLog("No HEAD found (new repository)")
 	}
 	// If HEAD doesn't exist (no commits yet), headTree will be nil and we'll treat all files as new
 
 	var changes strings.Builder
+	stagedFileCount := 0
 
 	for path, fileStatus := range status {
-		// Only process staged files
-		if fileStatus.Staging == git.Unmodified {
+		// Only process files that are actually staged (not unmodified, untracked, or unknown)
+		if fileStatus.Staging == git.Unmodified || fileStatus.Staging == git.Untracked {
 			continue
 		}
+		stagedFileCount++
+		debugLog("Processing staged file: %s (status: %s)", path, stagingStatusString(fileStatus.Staging))
 
 		changes.WriteString(fmt.Sprintf("\n=== %s ===\n", path))
 		changes.WriteString(fmt.Sprintf("Status: %s\n\n", stagingStatusString(fileStatus.Staging)))
 
-		// Get the staged content
-		stagedEntry, err := w.Filesystem.Stat(path)
-		if err == nil && !stagedEntry.IsDir() {
-			stagedFile, err := w.Filesystem.Open(path)
+		// Get the staged content from the index
+		var stagedContent string
+		if fileStatus.Staging == git.Deleted {
+			stagedContent = ""
+		} else {
+			// Read from worktree index (staged content)
+			file, err := w.Filesystem.Open(path)
 			if err == nil {
-				stagedContent, _ := io.ReadAll(stagedFile)
-				stagedFile.Close()
-
-				// Get the HEAD version for comparison (if HEAD exists)
-				var headContent string
-				if headTree != nil {
-					headEntry, err := headTree.File(path)
-					if err == nil {
-						headContent, _ = headEntry.Contents()
-					}
-				}
-
-				// Show a simple diff representation
-				if headContent == "" && len(stagedContent) > 0 {
-					changes.WriteString("New file:\n")
-					changes.WriteString(string(stagedContent))
-				} else if len(stagedContent) == 0 {
-					changes.WriteString("Deleted file\n")
-				} else {
-					changes.WriteString("Modified file:\n")
-					changes.WriteString(string(stagedContent))
-				}
-				changes.WriteString("\n")
+				content, _ := io.ReadAll(file)
+				file.Close()
+				stagedContent = string(content)
 			}
 		}
+
+		// Get the HEAD version for comparison (if HEAD exists)
+		var headContent string
+		if headTree != nil {
+			headEntry, err := headTree.File(path)
+			if err == nil {
+				headContent, _ = headEntry.Contents()
+			}
+		}
+
+		// Show a simple diff representation
+		if headContent == "" && stagedContent != "" {
+			changes.WriteString("New file:\n")
+			changes.WriteString(stagedContent)
+		} else if stagedContent == "" {
+			changes.WriteString("Deleted file\n")
+		} else {
+			changes.WriteString("Modified file:\n")
+			changes.WriteString(stagedContent)
+		}
+		changes.WriteString("\n")
 	}
 
+	debugLog("Processed %d staged files", stagedFileCount)
 	return changes.String(), nil
 }
 
@@ -227,6 +261,7 @@ Generate the commit message:`, changes)
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	debugLog("Sending request to OpenRouter API (payload size: %d bytes)", len(jsonBody))
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
@@ -242,8 +277,10 @@ Generate the commit message:`, changes)
 	}
 	defer resp.Body.Close()
 
+	debugLog("Received response with status: %d", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		debugLog("API error response: %s", string(body))
 		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -260,8 +297,10 @@ Generate the commit message:`, changes)
 	}
 
 	if len(result.Choices) == 0 {
+		debugLog("API returned empty choices array")
 		return "", fmt.Errorf("no response from API")
 	}
 
+	debugLog("Successfully decoded API response")
 	return strings.TrimSpace(result.Choices[0].Message.Content), nil
 }
