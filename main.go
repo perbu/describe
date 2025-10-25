@@ -29,17 +29,17 @@ type config struct {
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	err := run(ctx, os.Stdout, os.Args[1:], os.Environ())
+	err := run(ctx, os.Stdout, os.Args[1:])
 	if err != nil {
 		fmt.Println("error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, output io.Writer, argv []string, env []string) error {
+func run(ctx context.Context, output io.Writer, argv []string) error {
 	_, _ = fmt.Fprintf(output, "describe %s\n", strings.TrimSpace(embeddedVersion))
 
-	runConfig, showHelp, err := getConfig(argv, env)
+	runConfig, showHelp, err := getConfig(argv)
 	if err != nil {
 		return fmt.Errorf("getConfig: %w", err)
 	}
@@ -71,7 +71,7 @@ func run(ctx context.Context, output io.Writer, argv []string, env []string) err
 	return nil
 }
 
-func getConfig(args []string, env []string) (config, bool, error) {
+func getConfig(args []string) (config, bool, error) {
 	var cfg config
 	var showhelp bool
 
@@ -94,22 +94,12 @@ func getConfig(args []string, env []string) (config, bool, error) {
 	}
 
 	// Get API key from environment
-	cfg.apiKey = getEnv(env, "OPENROUTER_API_KEY")
+	cfg.apiKey = os.Getenv("OPENROUTER_API_KEY")
 	if cfg.apiKey == "" {
 		return config{}, false, fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
 	}
 
 	return cfg, false, nil
-}
-
-func getEnv(env []string, key string) string {
-	prefix := key + "="
-	for _, e := range env {
-		if strings.HasPrefix(e, prefix) {
-			return strings.TrimPrefix(e, prefix)
-		}
-	}
-	return ""
 }
 
 func getStagedChanges(repo *git.Repository) (string, error) {
