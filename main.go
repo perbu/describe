@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
@@ -205,7 +206,7 @@ func getStagedChanges(repo *git.Repository, cfg config) (string, error) {
 		return "", fmt.Errorf("worktree.Status: %w", err)
 	}
 
-	// Try to get HEAD, but handle the case where there are no commits yet
+	// Try to get HEAD tree, handle case where there are no commits yet
 	debugLog("Getting HEAD")
 	head, err := repo.Head()
 	var headTree *object.Tree
@@ -221,15 +222,15 @@ func getStagedChanges(repo *git.Repository, cfg config) (string, error) {
 		}
 	} else {
 		debugLog("No HEAD found (new repository)")
+		// For new repository, use empty tree
+		headTree = &object.Tree{}
 	}
-	// If HEAD doesn't exist (no commits yet), headTree will be nil and we'll treat all files as new
 
-	var changes strings.Builder
+	// Filter out binary files and ignored paths before generating diff
+	var filesToInclude []string
 	stagedFileCount := 0
-	totalLines := 0
-
 	for path, fileStatus := range status {
-		// Only process files that are actually staged (not unmodified, untracked, or unknown)
+		// Only process files that are actually staged
 		if fileStatus.Staging == git.Unmodified || fileStatus.Staging == git.Untracked {
 			continue
 		}
@@ -240,12 +241,11 @@ func getStagedChanges(repo *git.Repository, cfg config) (string, error) {
 			continue
 		}
 
-		// Skip binary files
+		// Skip binary files (unless deleted)
 		if fileStatus.Staging != git.Deleted {
 			binary, err := isBinary(path)
 			if err != nil {
 				debugLog("Error checking if file is binary: %s: %v", path, err)
-				// Continue processing the file if we can't determine if it's binary
 			} else if binary {
 				debugLog("Skipping binary file: %s", path)
 				continue
@@ -254,59 +254,96 @@ func getStagedChanges(repo *git.Repository, cfg config) (string, error) {
 
 		stagedFileCount++
 		debugLog("Processing staged file: %s (status: %s)", path, stagingStatusString(fileStatus.Staging))
-
-		changes.WriteString(fmt.Sprintf("\n=== %s ===\n", path))
-		changes.WriteString(fmt.Sprintf("Status: %s\n\n", stagingStatusString(fileStatus.Staging)))
-
-		// Get the staged content from the index
-		var stagedContent string
-		if fileStatus.Staging == git.Deleted {
-			stagedContent = ""
-		} else {
-			// Read from worktree index (staged content)
-			file, err := w.Filesystem.Open(path)
-			if err == nil {
-				content, _ := io.ReadAll(file)
-				file.Close()
-				stagedContent = string(content)
-			}
-		}
-
-		// Get the HEAD version for comparison (if HEAD exists)
-		var headContent string
-		if headTree != nil {
-			headEntry, err := headTree.File(path)
-			if err == nil {
-				headContent, _ = headEntry.Contents()
-			}
-		}
-
-		// Count lines in the content we're about to add
-		var contentToAdd string
-		if headContent == "" && stagedContent != "" {
-			contentToAdd = "New file:\n" + stagedContent
-		} else if stagedContent == "" {
-			contentToAdd = "Deleted file\n"
-		} else {
-			contentToAdd = "Modified file:\n" + stagedContent
-		}
-
-		// Count lines in this content
-		lineCount := strings.Count(contentToAdd, "\n")
-		totalLines += lineCount
-
-		// Check if we've exceeded the limit
-		if cfg.maxLines > 0 && totalLines > cfg.maxLines {
-			return "", fmt.Errorf("staged changes exceed maximum line limit of %d (currently at %d lines after %d files). Consider staging fewer files or using -max-lines flag to increase the limit", cfg.maxLines, totalLines, stagedFileCount)
-		}
-
-		// Show a simple diff representation
-		changes.WriteString(contentToAdd)
-		changes.WriteString("\n")
+		filesToInclude = append(filesToInclude, path)
 	}
 
-	debugLog("Processed %d staged files (%d total lines)", stagedFileCount, totalLines)
-	return changes.String(), nil
+	if stagedFileCount == 0 {
+		return "", nil
+	}
+
+	// Get the index to access staged file hashes
+	debugLog("Getting index")
+	idx, err := repo.Storer.Index()
+	if err != nil {
+		return "", fmt.Errorf("failed to get index: %w", err)
+	}
+
+	// Create a map of paths to hashes from the index
+	indexMap := make(map[string]plumbing.Hash)
+	for _, entry := range idx.Entries {
+		indexMap[entry.Name] = entry.Hash
+	}
+
+	// Manually generate diffs by fetching blob contents
+	debugLog("Generating diffs for staged files")
+	var patchBuf strings.Builder
+
+	for _, path := range filesToInclude {
+		fileStatus := status[path]
+
+		// Get HEAD content
+		var headContent string
+		var headHash plumbing.Hash
+		if fileStatus.Staging != git.Added && headTree != nil {
+			headFile, err := headTree.File(path)
+			if err == nil {
+				headContent, _ = headFile.Contents()
+				headHash = headFile.Hash
+			}
+		}
+
+		// Get staged content from index
+		var stagedContent string
+		var stagedHash plumbing.Hash
+		if fileStatus.Staging != git.Deleted {
+			if hash, ok := indexMap[path]; ok {
+				stagedHash = hash
+				// Fetch the blob object
+				blob, err := repo.BlobObject(hash)
+				if err == nil {
+					reader, _ := blob.Reader()
+					content, _ := io.ReadAll(reader)
+					reader.Close()
+					stagedContent = string(content)
+				}
+			}
+		}
+
+		// Generate diff header
+		if fileStatus.Staging == git.Added {
+			patchBuf.WriteString(fmt.Sprintf("diff --git a/%s b/%s\n", path, path))
+			patchBuf.WriteString("new file mode 100644\n")
+			patchBuf.WriteString(fmt.Sprintf("index 0000000..%s\n", stagedHash.String()[:7]))
+			patchBuf.WriteString("--- /dev/null\n")
+			patchBuf.WriteString(fmt.Sprintf("+++ b/%s\n", path))
+		} else if fileStatus.Staging == git.Deleted {
+			patchBuf.WriteString(fmt.Sprintf("diff --git a/%s b/%s\n", path, path))
+			patchBuf.WriteString("deleted file mode 100644\n")
+			patchBuf.WriteString(fmt.Sprintf("index %s..0000000\n", headHash.String()[:7]))
+			patchBuf.WriteString(fmt.Sprintf("--- a/%s\n", path))
+			patchBuf.WriteString("+++ /dev/null\n")
+		} else {
+			patchBuf.WriteString(fmt.Sprintf("diff --git a/%s b/%s\n", path, path))
+			patchBuf.WriteString(fmt.Sprintf("index %s..%s 100644\n", headHash.String()[:7], stagedHash.String()[:7]))
+			patchBuf.WriteString(fmt.Sprintf("--- a/%s\n", path))
+			patchBuf.WriteString(fmt.Sprintf("+++ b/%s\n", path))
+		}
+
+		// Generate unified diff content
+		diffContent := generateUnifiedDiffContent(headContent, stagedContent)
+		patchBuf.WriteString(diffContent)
+	}
+
+	patchStr := patchBuf.String()
+	lineCount := strings.Count(patchStr, "\n")
+
+	// Check if we've exceeded the limit
+	if cfg.maxLines > 0 && lineCount > cfg.maxLines {
+		return "", fmt.Errorf("staged changes exceed maximum line limit of %d (currently at %d lines). Consider staging fewer files or using -max-lines flag to increase the limit", cfg.maxLines, lineCount)
+	}
+
+	debugLog("Processed %d staged files (%d total lines)", stagedFileCount, lineCount)
+	return patchStr, nil
 }
 
 func stagingStatusString(status git.StatusCode) string {
@@ -324,6 +361,108 @@ func stagingStatusString(status git.StatusCode) string {
 	default:
 		return "Unknown"
 	}
+}
+
+// generateUnifiedDiffContent creates a unified diff from two strings
+func generateUnifiedDiffContent(oldContent, newContent string) string {
+	oldLines := strings.Split(oldContent, "\n")
+	newLines := strings.Split(newContent, "\n")
+
+	// Handle empty content
+	if oldContent == "" {
+		oldLines = []string{}
+	}
+	if newContent == "" {
+		newLines = []string{}
+	}
+
+	// Simple line-by-line diff (not optimal but works for our purpose)
+	var result strings.Builder
+
+	// For simplicity, we'll use a basic diff strategy
+	// Find common prefix and suffix
+	commonPrefix := 0
+	minLen := len(oldLines)
+	if len(newLines) < minLen {
+		minLen = len(newLines)
+	}
+
+	for commonPrefix < minLen && oldLines[commonPrefix] == newLines[commonPrefix] {
+		commonPrefix++
+	}
+
+	commonSuffix := 0
+	oldEnd := len(oldLines)
+	newEnd := len(newLines)
+	for commonSuffix < (minLen-commonPrefix) &&
+		oldLines[oldEnd-1-commonSuffix] == newLines[newEnd-1-commonSuffix] {
+		commonSuffix++
+	}
+
+	// Calculate hunk ranges
+	oldStart := commonPrefix
+	oldCount := len(oldLines) - commonPrefix - commonSuffix
+	newStart := commonPrefix
+	newCount := len(newLines) - commonPrefix - commonSuffix
+
+	// If there are no changes, return empty
+	if oldCount == 0 && newCount == 0 {
+		return ""
+	}
+
+	// Add context lines (3 before and after)
+	contextLines := 3
+	oldStart = oldStart - contextLines
+	if oldStart < 0 {
+		oldStart = 0
+	}
+	newStart = newStart - contextLines
+	if newStart < 0 {
+		newStart = 0
+	}
+
+	oldEnd = commonPrefix + oldCount + contextLines
+	if oldEnd > len(oldLines) {
+		oldEnd = len(oldLines)
+	}
+	newEnd = commonPrefix + newCount + contextLines
+	if newEnd > len(newLines) {
+		newEnd = len(newLines)
+	}
+
+	oldCount = oldEnd - oldStart
+	newCount = newEnd - newStart
+
+	// Write hunk header
+	result.WriteString(fmt.Sprintf("@@ -%d,%d +%d,%d @@\n",
+		oldStart+1, oldCount, newStart+1, newCount))
+
+	// Write context before changes
+	for i := oldStart; i < commonPrefix && i < oldEnd; i++ {
+		result.WriteString(" " + oldLines[i] + "\n")
+	}
+
+	// Write removed lines
+	for i := commonPrefix; i < commonPrefix+oldCount-contextLines && i < len(oldLines)-commonSuffix; i++ {
+		if i < len(oldLines) {
+			result.WriteString("-" + oldLines[i] + "\n")
+		}
+	}
+
+	// Write added lines
+	for i := commonPrefix; i < commonPrefix+newCount-contextLines && i < len(newLines)-commonSuffix; i++ {
+		if i < len(newLines) {
+			result.WriteString("+" + newLines[i] + "\n")
+		}
+	}
+
+	// Write context after changes
+	startSuffix := len(oldLines) - commonSuffix
+	for i := startSuffix; i < oldEnd && i < len(oldLines); i++ {
+		result.WriteString(" " + oldLines[i] + "\n")
+	}
+
+	return result.String()
 }
 
 func describeChanges(ctx context.Context, cfg config, changes string) (string, error) {
@@ -363,6 +502,11 @@ Generate the commit message:`, changes)
 	}
 
 	debugLog("Sending request to OpenRouter API (payload size: %d bytes)", len(jsonBody))
+	if cfg.debug {
+		fmt.Fprintln(os.Stderr, "[DEBUG] === Full prompt being sent to LLM ===")
+		fmt.Fprintln(os.Stderr, prompt)
+		fmt.Fprintln(os.Stderr, "[DEBUG] === End of prompt ===")
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
