@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -22,13 +23,81 @@ import (
 var embeddedVersion string
 
 type config struct {
-	apiKey string
-	model  string
-	debug  bool
+	apiKey   string
+	model    string
+	debug    bool
+	maxLines int
 }
 
 var debugLog = func(format string, args ...interface{}) {
 	// no-op by default
+}
+
+// ignoredDirs contains directory names that should be skipped
+var ignoredDirs = []string{
+	"vendor",
+	"node_modules",
+	".git",
+	"dist",
+	"build",
+	"target",
+	".next",
+	".nuxt",
+	"__pycache__",
+	".pytest_cache",
+	".tox",
+	"venv",
+	".venv",
+}
+
+// shouldIgnorePath checks if a path should be ignored based on directory patterns
+func shouldIgnorePath(path string) bool {
+	parts := strings.Split(filepath.ToSlash(path), "/")
+	for _, part := range parts {
+		for _, ignored := range ignoredDirs {
+			if part == ignored {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isBinary checks if a file appears to be binary by examining its contents
+func isBinary(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	// Read a sample — 8KB is enough to classify most files.
+	buf := make([]byte, 8192)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	buf = buf[:n]
+
+	// Empty files are not binary
+	if n == 0 {
+		return false, nil
+	}
+
+	// Heuristic: if any NUL (0x00) bytes exist, assume binary.
+	if bytes.IndexByte(buf, 0x00) != -1 {
+		return true, nil
+	}
+
+	// Heuristic: count printable ASCII and UTF-8 valid characters.
+	printable := 0
+	for _, b := range buf {
+		if b == 9 || b == 10 || b == 13 || (b >= 32 && b <= 126) {
+			printable++
+		}
+	}
+	ratio := float64(printable) / float64(len(buf))
+	return ratio < 0.95, nil // mostly printable = text
 }
 
 func main() {
@@ -67,7 +136,7 @@ func run(ctx context.Context, output io.Writer, argv []string) error {
 	}
 
 	debugLog("Getting staged changes")
-	changes, err := getStagedChanges(repo)
+	changes, err := getStagedChanges(repo, runConfig)
 	if err != nil {
 		return fmt.Errorf("getStagedChanges: %w", err)
 	}
@@ -97,6 +166,7 @@ func getConfig(args []string) (config, bool, error) {
 	flagSet := flag.NewFlagSet("describe", flag.ContinueOnError)
 	flagSet.StringVar(&cfg.model, "model", "anthropic/claude-4.5-sonnet", "Model to use for description.")
 	flagSet.BoolVar(&cfg.debug, "debug", false, "Enable debug logging.")
+	flagSet.IntVar(&cfg.maxLines, "max-lines", 10000, "Maximum number of lines to process before bailing out.")
 	flagSet.BoolVar(&showhelp, "help", false, "Show help message.")
 
 	err := flagSet.Parse(args)
@@ -122,7 +192,7 @@ func getConfig(args []string) (config, bool, error) {
 	return cfg, false, nil
 }
 
-func getStagedChanges(repo *git.Repository) (string, error) {
+func getStagedChanges(repo *git.Repository, cfg config) (string, error) {
 	debugLog("Getting worktree")
 	w, err := repo.Worktree()
 	if err != nil {
@@ -156,12 +226,32 @@ func getStagedChanges(repo *git.Repository) (string, error) {
 
 	var changes strings.Builder
 	stagedFileCount := 0
+	totalLines := 0
 
 	for path, fileStatus := range status {
 		// Only process files that are actually staged (not unmodified, untracked, or unknown)
 		if fileStatus.Staging == git.Unmodified || fileStatus.Staging == git.Untracked {
 			continue
 		}
+
+		// Skip ignored directories
+		if shouldIgnorePath(path) {
+			debugLog("Skipping ignored path: %s", path)
+			continue
+		}
+
+		// Skip binary files
+		if fileStatus.Staging != git.Deleted {
+			binary, err := isBinary(path)
+			if err != nil {
+				debugLog("Error checking if file is binary: %s: %v", path, err)
+				// Continue processing the file if we can't determine if it's binary
+			} else if binary {
+				debugLog("Skipping binary file: %s", path)
+				continue
+			}
+		}
+
 		stagedFileCount++
 		debugLog("Processing staged file: %s (status: %s)", path, stagingStatusString(fileStatus.Staging))
 
@@ -191,20 +281,31 @@ func getStagedChanges(repo *git.Repository) (string, error) {
 			}
 		}
 
-		// Show a simple diff representation
+		// Count lines in the content we're about to add
+		var contentToAdd string
 		if headContent == "" && stagedContent != "" {
-			changes.WriteString("New file:\n")
-			changes.WriteString(stagedContent)
+			contentToAdd = "New file:\n" + stagedContent
 		} else if stagedContent == "" {
-			changes.WriteString("Deleted file\n")
+			contentToAdd = "Deleted file\n"
 		} else {
-			changes.WriteString("Modified file:\n")
-			changes.WriteString(stagedContent)
+			contentToAdd = "Modified file:\n" + stagedContent
 		}
+
+		// Count lines in this content
+		lineCount := strings.Count(contentToAdd, "\n")
+		totalLines += lineCount
+
+		// Check if we've exceeded the limit
+		if cfg.maxLines > 0 && totalLines > cfg.maxLines {
+			return "", fmt.Errorf("staged changes exceed maximum line limit of %d (currently at %d lines after %d files). Consider staging fewer files or using -max-lines flag to increase the limit", cfg.maxLines, totalLines, stagedFileCount)
+		}
+
+		// Show a simple diff representation
+		changes.WriteString(contentToAdd)
 		changes.WriteString("\n")
 	}
 
-	debugLog("Processed %d staged files", stagedFileCount)
+	debugLog("Processed %d staged files (%d total lines)", stagedFileCount, totalLines)
 	return changes.String(), nil
 }
 
