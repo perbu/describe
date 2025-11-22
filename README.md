@@ -31,7 +31,7 @@ describe -provider openrouter
 
 ### Config File (Optional)
 
-Create a config file at `~/.config/describe/config.yaml` (Linux/macOS) or `%APPDATA%\describe\config.yaml` (Windows):
+Create a config file at `~/.config/describe/config.yaml` (Linux/macOS).
 
 ```yaml
 provider: ollama          # or "openrouter"
