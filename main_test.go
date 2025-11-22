@@ -107,58 +107,73 @@ func TestGetConfig(t *testing.T) {
 	}()
 
 	tests := []struct {
-		name           string
-		args           []string
-		envKey         string
-		expectError    bool
-		expectHelp     bool
-		expectedModel  string
-		expectedDebug  bool
+		name             string
+		args             []string
+		envKey           string
+		expectError      bool
+		expectHelp       bool
+		expectedModel    string
+		expectedProvider string
+		expectedDebug    bool
 		expectedMaxLines int
 	}{
 		{
-			name:           "default values",
-			args:           []string{},
-			envKey:         "test-key",
-			expectError:    false,
-			expectHelp:     false,
-			expectedModel:  "anthropic/claude-4.5-sonnet",
-			expectedDebug:  false,
+			name:             "default values (ollama)",
+			args:             []string{},
+			envKey:           "",
+			expectError:      false,
+			expectHelp:       false,
+			expectedModel:    "llama3.2",
+			expectedProvider: "ollama",
+			expectedDebug:    false,
 			expectedMaxLines: 10000,
 		},
 		{
-			name:           "custom max-lines",
-			args:           []string{"-max-lines", "5000"},
-			envKey:         "test-key",
-			expectError:    false,
-			expectHelp:     false,
-			expectedModel:  "anthropic/claude-4.5-sonnet",
-			expectedDebug:  false,
+			name:             "custom max-lines",
+			args:             []string{"-max-lines", "5000"},
+			envKey:           "",
+			expectError:      false,
+			expectHelp:       false,
+			expectedModel:    "llama3.2",
+			expectedProvider: "ollama",
+			expectedDebug:    false,
 			expectedMaxLines: 5000,
 		},
 		{
-			name:           "custom model and debug",
-			args:           []string{"-model", "gpt-4", "-debug"},
-			envKey:         "test-key",
-			expectError:    false,
-			expectHelp:     false,
-			expectedModel:  "gpt-4",
-			expectedDebug:  true,
+			name:             "custom model and debug",
+			args:             []string{"-model", "gpt-4", "-debug"},
+			envKey:           "",
+			expectError:      false,
+			expectHelp:       false,
+			expectedModel:    "gpt-4",
+			expectedProvider: "ollama",
+			expectedDebug:    true,
 			expectedMaxLines: 10000,
 		},
 		{
 			name:        "help flag",
 			args:        []string{"-help"},
-			envKey:      "test-key",
+			envKey:      "",
 			expectError: false,
 			expectHelp:  true,
 		},
 		{
-			name:        "missing API key",
-			args:        []string{},
+			name:        "missing API key for openrouter",
+			args:        []string{"-provider", "openrouter"},
 			envKey:      "",
 			expectError: true,
 			expectHelp:  false,
+		},
+		{
+			name:             "openrouter with API key",
+			args:             []string{"-provider", "openrouter"},
+			envKey:           "test-key",
+			expectError:      false,
+			expectHelp:       false,
+			expectedModel:    "anthropic/claude-4.5-sonnet",
+			expectedProvider: "openrouter",
+			expectedDebug:    false,
+			expectedMaxLines: 10000,
 		},
 	}
 
@@ -186,6 +201,9 @@ func TestGetConfig(t *testing.T) {
 			if !tt.expectError && !tt.expectHelp {
 				if cfg.model != tt.expectedModel {
 					t.Errorf("getConfig() model = %q, expected %q", cfg.model, tt.expectedModel)
+				}
+				if cfg.provider != tt.expectedProvider {
+					t.Errorf("getConfig() provider = %q, expected %q", cfg.provider, tt.expectedProvider)
 				}
 				if cfg.debug != tt.expectedDebug {
 					t.Errorf("getConfig() debug = %v, expected %v", cfg.debug, tt.expectedDebug)

@@ -18,16 +18,30 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"gopkg.in/yaml.v3"
 )
 
 //go:embed .version
 var embeddedVersion string
 
+// fileConfig represents the YAML config file structure
+type fileConfig struct {
+	Provider    string `yaml:"provider"`     // "openrouter" or "ollama"
+	APIKey      string `yaml:"api_key"`      // For OpenRouter
+	APIEndpoint string `yaml:"api_endpoint"` // Custom endpoint (optional)
+	Model       string `yaml:"model"`
+	Debug       bool   `yaml:"debug"`
+	MaxLines    int    `yaml:"max_lines"`
+}
+
+// config represents the runtime configuration
 type config struct {
-	apiKey   string
-	model    string
-	debug    bool
-	maxLines int
+	provider    string
+	apiKey      string
+	apiEndpoint string
+	model       string
+	debug       bool
+	maxLines    int
 }
 
 var debugLog = func(format string, args ...interface{}) {
@@ -149,7 +163,7 @@ func run(ctx context.Context, output io.Writer, argv []string) error {
 	}
 
 	debugLog("Found staged changes (%d bytes)", len(changes))
-	debugLog("Calling OpenRouter API")
+	debugLog("Calling %s API", runConfig.provider)
 	description, err := describeChanges(ctx, runConfig, changes)
 	if err != nil {
 		return fmt.Errorf("describeChanges: %w", err)
@@ -160,17 +174,91 @@ func run(ctx context.Context, output io.Writer, argv []string) error {
 	return nil
 }
 
+// loadConfigFile loads configuration from the YAML file
+func loadConfigFile() (fileConfig, error) {
+	// Get config directory using stdlib
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return fileConfig{}, fmt.Errorf("failed to get config directory: %w", err)
+	}
+
+	configPath := filepath.Join(configDir, "describe", "config.yaml")
+
+	// If config file doesn't exist, return defaults
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		debugLog("No config file found at %s, using defaults", configPath)
+		return fileConfig{
+			Provider:    "ollama",
+			APIEndpoint: "http://localhost:11434",
+			Model:       "llama3.2",
+			MaxLines:    10000,
+		}, nil
+	}
+
+	debugLog("Loading config from %s", configPath)
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fileConfig{}, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var cfg fileConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return fileConfig{}, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// Set defaults if not specified in config file
+	if cfg.Provider == "" {
+		cfg.Provider = "ollama"
+	}
+	if cfg.APIEndpoint == "" {
+		if cfg.Provider == "ollama" {
+			cfg.APIEndpoint = "http://localhost:11434"
+		} else if cfg.Provider == "openrouter" {
+			cfg.APIEndpoint = "https://openrouter.ai/api/v1"
+		}
+	}
+	if cfg.Model == "" {
+		if cfg.Provider == "ollama" {
+			cfg.Model = "llama3.2"
+		} else {
+			cfg.Model = "anthropic/claude-4.5-sonnet"
+		}
+	}
+	if cfg.MaxLines == 0 {
+		cfg.MaxLines = 10000
+	}
+
+	return cfg, nil
+}
+
 func getConfig(args []string) (config, bool, error) {
+	// Load config from file first
+	fileCfg, err := loadConfigFile()
+	if err != nil {
+		return config{}, false, fmt.Errorf("loadConfigFile: %w", err)
+	}
+
+	// Initialize runtime config with file config values
 	var cfg config
+	cfg.provider = fileCfg.Provider
+	cfg.apiKey = fileCfg.APIKey
+	cfg.apiEndpoint = fileCfg.APIEndpoint
+	cfg.model = fileCfg.Model
+	cfg.debug = fileCfg.Debug
+	cfg.maxLines = fileCfg.MaxLines
+
 	var showhelp bool
+	var modelFlag, providerFlag, endpointFlag string
 
 	flagSet := flag.NewFlagSet("describe", flag.ContinueOnError)
-	flagSet.StringVar(&cfg.model, "model", "anthropic/claude-4.5-sonnet", "Model to use for description.")
-	flagSet.BoolVar(&cfg.debug, "debug", false, "Enable debug logging.")
-	flagSet.IntVar(&cfg.maxLines, "max-lines", 10000, "Maximum number of lines to process before bailing out.")
-	flagSet.BoolVar(&showhelp, "help", false, "Show help message.")
+	flagSet.StringVar(&providerFlag, "provider", "", "API provider (openrouter or ollama)")
+	flagSet.StringVar(&modelFlag, "model", "", "Model to use for description")
+	flagSet.StringVar(&endpointFlag, "endpoint", "", "API endpoint URL")
+	flagSet.BoolVar(&cfg.debug, "debug", cfg.debug, "Enable debug logging")
+	flagSet.IntVar(&cfg.maxLines, "max-lines", cfg.maxLines, "Maximum number of lines to process")
+	flagSet.BoolVar(&showhelp, "help", false, "Show help message")
 
-	err := flagSet.Parse(args)
+	err = flagSet.Parse(args)
 	if err != nil {
 		return config{}, false, fmt.Errorf("failed to parse flags: %w", err)
 	}
@@ -179,15 +267,50 @@ func getConfig(args []string) (config, bool, error) {
 		return config{}, true, nil
 	}
 
+	// CLI flags override config file
+	if providerFlag != "" {
+		cfg.provider = providerFlag
+		// If provider changed and model/endpoint weren't explicitly set, use provider's defaults
+		if modelFlag == "" {
+			if cfg.provider == "ollama" {
+				cfg.model = "llama3.2"
+			} else if cfg.provider == "openrouter" {
+				cfg.model = "anthropic/claude-4.5-sonnet"
+			}
+		}
+		if endpointFlag == "" {
+			if cfg.provider == "ollama" {
+				cfg.apiEndpoint = "http://localhost:11434"
+			} else if cfg.provider == "openrouter" {
+				cfg.apiEndpoint = "https://openrouter.ai/api/v1"
+			}
+		}
+	}
+	if modelFlag != "" {
+		cfg.model = modelFlag
+	}
+	if endpointFlag != "" {
+		cfg.apiEndpoint = endpointFlag
+	}
+
 	// check if there are any arguments left
 	if flagSet.NArg() > 0 {
 		return config{}, false, fmt.Errorf("unexpected arguments: %s", flagSet.Args())
 	}
 
-	// Get API key from environment
-	cfg.apiKey = os.Getenv("OPENROUTER_API_KEY")
+	// Get API key from environment if not in config file (for OpenRouter)
 	if cfg.apiKey == "" {
-		return config{}, false, fmt.Errorf("OPENROUTER_API_KEY environment variable not set")
+		cfg.apiKey = os.Getenv("OPENROUTER_API_KEY")
+	}
+
+	// Validate provider
+	if cfg.provider != "openrouter" && cfg.provider != "ollama" {
+		return config{}, false, fmt.Errorf("invalid provider: %s (must be 'openrouter' or 'ollama')", cfg.provider)
+	}
+
+	// Check API key for OpenRouter
+	if cfg.provider == "openrouter" && cfg.apiKey == "" {
+		return config{}, false, fmt.Errorf("OPENROUTER_API_KEY environment variable or api_key in config file required for OpenRouter provider")
 	}
 
 	return cfg, false, nil
@@ -466,6 +589,99 @@ func generateUnifiedDiffContent(oldContent, newContent string) string {
 }
 
 func describeChanges(ctx context.Context, cfg config, changes string) (string, error) {
+	if cfg.provider == "ollama" {
+		return describeChangesOllama(ctx, cfg, changes)
+	}
+	return describeChangesOpenRouter(ctx, cfg, changes)
+}
+
+func describeChangesOllama(ctx context.Context, cfg config, changes string) (string, error) {
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+
+	type request struct {
+		Model    string    `json:"model"`
+		Messages []message `json:"messages"`
+		Stream   bool      `json:"stream"`
+	}
+
+	prompt := fmt.Sprintf(`You are a helpful assistant that writes git commit messages.
+Based on the following staged changes, generate a properly formatted git commit message.
+
+Format requirements:
+- First line: Short summary (50-72 chars) describing WHAT changed and WHY
+- Second line: Blank line
+- Following lines: More detailed explanation of the changes, their purpose and impact
+
+Staged changes:
+%s
+
+Generate the commit message:`, changes)
+
+	reqBody := request{
+		Model: cfg.model,
+		Messages: []message{
+			{Role: "user", Content: prompt},
+		},
+		Stream: false,
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	debugLog("Sending request to Ollama API (payload size: %d bytes)", len(jsonBody))
+	if cfg.debug {
+		fmt.Fprintln(os.Stderr, "[DEBUG] === Full prompt being sent to LLM ===")
+		fmt.Fprintln(os.Stderr, prompt)
+		fmt.Fprintln(os.Stderr, "[DEBUG] === End of prompt ===")
+	}
+
+	endpoint := cfg.apiEndpoint + "/api/chat"
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	debugLog("Received response with status: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		debugLog("API error response: %s", string(body))
+		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if result.Message.Content == "" {
+		debugLog("API returned empty message content")
+		return "", fmt.Errorf("no response from API")
+	}
+
+	debugLog("Successfully decoded API response")
+	return strings.TrimSpace(result.Message.Content), nil
+}
+
+func describeChangesOpenRouter(ctx context.Context, cfg config, changes string) (string, error) {
 	type message struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
@@ -507,7 +723,9 @@ Generate the commit message:`, changes)
 		fmt.Fprintln(os.Stderr, prompt)
 		fmt.Fprintln(os.Stderr, "[DEBUG] === End of prompt ===")
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(jsonBody))
+
+	endpoint := cfg.apiEndpoint + "/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}

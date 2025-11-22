@@ -1,0 +1,27 @@
+# Example configuration file for describe
+# Copy this file to your config directory:
+#   Linux/macOS: ~/.config/describe/config.yaml
+#   Windows: %APPDATA%\describe\config.yaml
+
+# API provider: "ollama" (local) or "openrouter" (cloud)
+provider: ollama
+
+# API endpoint (optional - will use provider default if not specified)
+# Ollama default: http://localhost:11434
+# OpenRouter default: https://openrouter.ai/api/v1
+api_endpoint: http://localhost:11434
+
+# Model to use for generating commit messages
+# Ollama examples: llama3.2, codellama, mistral
+# OpenRouter examples: anthropic/claude-4.5-sonnet, openai/gpt-4
+model: llama3.2
+
+# API key (only required for OpenRouter)
+# Can also be set via OPENROUTER_API_KEY environment variable
+api_key: ""
+
+# Enable debug logging
+debug: false
+
+# Maximum number of lines to process before bailing out
+max_lines: 10000
