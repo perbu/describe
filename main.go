@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -31,6 +32,7 @@ type fileConfig struct {
 	APIEndpoint string `yaml:"api_endpoint"` // Custom endpoint (optional)
 	Model       string `yaml:"model"`
 	Debug       bool   `yaml:"debug"`
+	Verbose     bool   `yaml:"verbose"`
 	MaxLines    int    `yaml:"max_lines"`
 }
 
@@ -41,7 +43,18 @@ type config struct {
 	apiEndpoint string
 	model       string
 	debug       bool
+	verbose     bool
 	maxLines    int
+}
+
+// responseMetadata holds stats from the LLM API response
+type responseMetadata struct {
+	model            string
+	promptTokens     int
+	completionTokens int
+	totalTokens      int
+	duration         float64 // seconds
+	requestID        string  // OpenRouter only
 }
 
 var debugLog = func(format string, args ...interface{}) {
@@ -164,14 +177,34 @@ func run(ctx context.Context, output io.Writer, argv []string) error {
 
 	debugLog("Found staged changes (%d bytes)", len(changes))
 	debugLog("Calling %s API", runConfig.provider)
-	description, err := describeChanges(ctx, runConfig, changes)
+	description, meta, err := describeChanges(ctx, runConfig, changes)
 	if err != nil {
 		return fmt.Errorf("describeChanges: %w", err)
 	}
 
 	debugLog("Received description from API (%d bytes)", len(description))
 	_, _ = fmt.Fprintf(output, "%s\n", description)
+
+	if runConfig.verbose {
+		printVerboseStats(meta)
+	}
 	return nil
+}
+
+func printVerboseStats(meta responseMetadata) {
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "--- Stats ---")
+	fmt.Fprintf(os.Stderr, "Model:       %s\n", meta.model)
+	fmt.Fprintf(os.Stderr, "Tokens:      %d prompt + %d completion = %d total\n",
+		meta.promptTokens, meta.completionTokens, meta.totalTokens)
+	fmt.Fprintf(os.Stderr, "Duration:    %.2fs\n", meta.duration)
+	if meta.completionTokens > 0 && meta.duration > 0 {
+		tokensPerSec := float64(meta.completionTokens) / meta.duration
+		fmt.Fprintf(os.Stderr, "Speed:       %.1f tokens/sec\n", tokensPerSec)
+	}
+	if meta.requestID != "" {
+		fmt.Fprintf(os.Stderr, "Request ID:  %s\n", meta.requestID)
+	}
 }
 
 // loadConfigFile loads configuration from the YAML file
@@ -245,18 +278,33 @@ func getConfig(args []string) (config, bool, error) {
 	cfg.apiEndpoint = fileCfg.APIEndpoint
 	cfg.model = fileCfg.Model
 	cfg.debug = fileCfg.Debug
+	cfg.verbose = fileCfg.Verbose
 	cfg.maxLines = fileCfg.MaxLines
 
 	var showhelp bool
 	var modelFlag, providerFlag, endpointFlag string
+
+	// Determine config file path for help output
+	configDir, _ := os.UserConfigDir()
+	configPath := filepath.Join(configDir, "describe", "config.yaml")
 
 	flagSet := flag.NewFlagSet("describe", flag.ContinueOnError)
 	flagSet.StringVar(&providerFlag, "provider", "", "API provider (openrouter or ollama)")
 	flagSet.StringVar(&modelFlag, "model", "", "Model to use for description")
 	flagSet.StringVar(&endpointFlag, "endpoint", "", "API endpoint URL")
 	flagSet.BoolVar(&cfg.debug, "debug", cfg.debug, "Enable debug logging")
+	flagSet.BoolVar(&cfg.verbose, "verbose", cfg.verbose, "Show token usage and timing stats")
+	flagSet.BoolVar(&cfg.verbose, "v", cfg.verbose, "Show token usage and timing stats (shorthand)")
 	flagSet.IntVar(&cfg.maxLines, "max-lines", cfg.maxLines, "Maximum number of lines to process")
 	flagSet.BoolVar(&showhelp, "help", false, "Show help message")
+
+	flagSet.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: describe [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Generate AI-powered descriptions of staged git changes.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flagSet.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nConfig file: %s\n", configPath)
+	}
 
 	err = flagSet.Parse(args)
 	if err != nil {
@@ -588,14 +636,14 @@ func generateUnifiedDiffContent(oldContent, newContent string) string {
 	return result.String()
 }
 
-func describeChanges(ctx context.Context, cfg config, changes string) (string, error) {
+func describeChanges(ctx context.Context, cfg config, changes string) (string, responseMetadata, error) {
 	if cfg.provider == "ollama" {
 		return describeChangesOllama(ctx, cfg, changes)
 	}
 	return describeChangesOpenRouter(ctx, cfg, changes)
 }
 
-func describeChangesOllama(ctx context.Context, cfg config, changes string) (string, error) {
+func describeChangesOllama(ctx context.Context, cfg config, changes string) (string, responseMetadata, error) {
 	type message struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
@@ -614,6 +662,7 @@ Format requirements:
 - First line: Short summary (50-72 chars) describing WHAT changed and WHY
 - Second line: Blank line
 - Following lines: More detailed explanation of the changes, their purpose and impact
+- Output ONLY the commit message in plain text, without markdown code blocks or formatting
 
 Staged changes:
 %s
@@ -630,7 +679,7 @@ Generate the commit message:`, changes)
 
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return "", responseMetadata{}, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	debugLog("Sending request to Ollama API (payload size: %d bytes)", len(jsonBody))
@@ -643,15 +692,16 @@ Generate the commit message:`, changes)
 	endpoint := cfg.apiEndpoint + "/api/chat"
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return "", responseMetadata{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{}
+	startTime := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to send request: %w", err)
+		return "", responseMetadata{}, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -659,29 +709,42 @@ Generate the commit message:`, changes)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		debugLog("API error response: %s", string(body))
-		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		return "", responseMetadata{}, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
+		Model   string `json:"model"`
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
+		PromptEvalCount int   `json:"prompt_eval_count"`
+		EvalCount       int   `json:"eval_count"`
+		EvalDuration    int64 `json:"eval_duration"` // nanoseconds
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
+		return "", responseMetadata{}, fmt.Errorf("failed to decode response: %w", err)
 	}
+	duration := time.Since(startTime).Seconds()
 
 	if result.Message.Content == "" {
 		debugLog("API returned empty message content")
-		return "", fmt.Errorf("no response from API")
+		return "", responseMetadata{}, fmt.Errorf("no response from API")
+	}
+
+	meta := responseMetadata{
+		model:            result.Model,
+		promptTokens:     result.PromptEvalCount,
+		completionTokens: result.EvalCount,
+		totalTokens:      result.PromptEvalCount + result.EvalCount,
+		duration:         duration,
 	}
 
 	debugLog("Successfully decoded API response")
-	return strings.TrimSpace(result.Message.Content), nil
+	return strings.TrimSpace(result.Message.Content), meta, nil
 }
 
-func describeChangesOpenRouter(ctx context.Context, cfg config, changes string) (string, error) {
+func describeChangesOpenRouter(ctx context.Context, cfg config, changes string) (string, responseMetadata, error) {
 	type message struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
@@ -699,6 +762,7 @@ Format requirements:
 - First line: Short summary (50-72 chars) describing WHAT changed and WHY
 - Second line: Blank line
 - Following lines: More detailed explanation of the changes, their purpose and impact
+- Output ONLY the commit message in plain text, without markdown code blocks or formatting
 
 Staged changes:
 %s
@@ -714,7 +778,7 @@ Generate the commit message:`, changes)
 
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return "", responseMetadata{}, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	debugLog("Sending request to OpenRouter API (payload size: %d bytes)", len(jsonBody))
@@ -727,16 +791,17 @@ Generate the commit message:`, changes)
 	endpoint := cfg.apiEndpoint + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return "", responseMetadata{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
 
 	client := &http.Client{}
+	startTime := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to send request: %w", err)
+		return "", responseMetadata{}, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -744,26 +809,43 @@ Generate the commit message:`, changes)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		debugLog("API error response: %s", string(body))
-		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		return "", responseMetadata{}, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
+		ID      string `json:"id"`
+		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
+		return "", responseMetadata{}, fmt.Errorf("failed to decode response: %w", err)
 	}
+	duration := time.Since(startTime).Seconds()
 
 	if len(result.Choices) == 0 {
 		debugLog("API returned empty choices array")
-		return "", fmt.Errorf("no response from API")
+		return "", responseMetadata{}, fmt.Errorf("no response from API")
+	}
+
+	meta := responseMetadata{
+		model:            result.Model,
+		promptTokens:     result.Usage.PromptTokens,
+		completionTokens: result.Usage.CompletionTokens,
+		totalTokens:      result.Usage.TotalTokens,
+		duration:         duration,
+		requestID:        result.ID,
 	}
 
 	debugLog("Successfully decoded API response")
-	return strings.TrimSpace(result.Choices[0].Message.Content), nil
+	return strings.TrimSpace(result.Choices[0].Message.Content), meta, nil
 }
